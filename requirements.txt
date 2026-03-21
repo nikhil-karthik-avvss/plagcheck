@@ -1,2 +1,11 @@
+# Core PDF extraction
 pdfplumber>=0.10.0
 pypdf>=4.0.0
+pdfminer.six>=20221105
+
+# Image extraction & comparison
+pymupdf>=1.23.0
+pillow>=10.0.0
+
+# OCR (requires tesseract-ocr system package)
+pytesseract>=0.3.10
