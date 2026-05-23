@@ -1,109 +1,345 @@
 #!/usr/bin/env python3
 """
-Assignment Plagiarism Checker
-Compares two PDF assignments across text, code, images, and structure.
+plagcheck — Assignment Plagiarism Checker
+Robust comparison across text, code, visuals, and structure.
+Works with PDFs from Word, LibreOffice, LaTeX, scanners, or any source.
 """
 
 import sys
 import os
 import re
 import ast
+import io
 import math
-import hashlib
 import argparse
-import tempfile
-import subprocess
 from collections import Counter
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PDF TEXT EXTRACTION
+# HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_text_from_pdf(pdf_path: str) -> str:
-    if not os.path.isfile(pdf_path):
-        print(f"[ERROR] File not found: {pdf_path}")
-        sys.exit(1)
+COLORS = {
+    "reset":  "\033[0m", "bold":   "\033[1m",
+    "red":    "\033[91m","yellow": "\033[93m",
+    "green":  "\033[92m","cyan":   "\033[96m",
+    "dim":    "\033[2m", "blue":   "\033[94m",
+}
+def c(color, text): return f"{COLORS.get(color,'')}{text}{COLORS['reset']}"
+def die(msg):  print(c("red", f"\n  [ERROR] {msg}")); sys.exit(1)
+def warn(msg): print(c("yellow", f"  [WARN] {msg}"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 1 — PAGE RASTERIZATION
+# Converts every PDF page to a PIL Image.
+# • 150 DPI  → visual comparison (perceptual hashing)
+# • 250 DPI  → OCR-quality render (used in extract_all_text if needed)
+# Works regardless of PDF origin: Word, LibreOffice, LaTeX, scanner.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rasterize_pdf(pdf_path: str, dpi: int = 150) -> list:
+    """Return list of (PIL.Image, page_number) for every page."""
+    try:
+        import fitz
+        from PIL import Image
+    except ImportError as e:
+        die(f"PyMuPDF / Pillow not installed: {e}")
+
+    pages = []
+    try:
+        doc = fitz.open(pdf_path)
+        zoom = dpi / 72.0
+        mat  = fitz.Matrix(zoom, zoom)
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            pages.append((img, i + 1))
+        doc.close()
+    except Exception as e:
+        die(f"Could not open {pdf_path}: {e}")
+    return pages
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 2 — TEXT EXTRACTION
+# Three-stage pipeline, all stages run and results are merged:
+#
+#   Stage 1: pdfplumber  — best for digital PDFs (Word, LibreOffice, LaTeX)
+#   Stage 2: PyMuPDF     — fast fallback for most digitally-created PDFs
+#   Stage 3: easyocr     — fully pip-installable OCR engine (no system binary
+#                          needed). Runs on rasterized pages to catch:
+#                            • scanned / image-only PDFs
+#                            • text inside embedded figures/diagrams
+#                            • handwritten labels
+#
+# Merging: OCR output lines that are NOT already present in digital text
+# (< 40% token overlap) are appended, so we get the union of both.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_digital(pdf_path: str) -> str:
+    """Embedded-text extraction: pdfplumber then PyMuPDF fallback."""
     try:
         import pdfplumber
         parts = []
         with pdfplumber.open(pdf_path) as pdf:
             for page in pdf.pages:
                 t = page.extract_text()
-                if t:
-                    parts.append(t)
+                if t: parts.append(t)
         text = "\n".join(parts).strip()
-        if text:
+        if len(text.split()) > 30:
             return text
     except Exception:
         pass
     try:
-        from pypdf import PdfReader
-        reader = PdfReader(pdf_path)
-        parts = []
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                parts.append(t)
-        text = "\n".join(parts).strip()
-        if text:
-            return text
+        import fitz
+        doc = fitz.open(pdf_path)
+        parts = [page.get_text() for page in doc]
+        doc.close()
+        return "\n".join(p for p in parts if p).strip()
     except Exception:
         pass
     return ""
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# OCR (SCANNED PDF SUPPORT)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def ocr_pdf(pdf_path: str) -> str:
-    """Rasterize each page and run Tesseract OCR on it."""
+def _run_easyocr(page_images: list) -> str:
+    """
+    Run easyocr on pre-rasterized page images.
+    easyocr is fully pip-installable — no system Tesseract binary required.
+    """
     try:
-        import fitz          # PyMuPDF
-        import pytesseract
-        from PIL import Image
+        import easyocr
         import numpy as np
-    except ImportError as e:
-        print(f"  [WARN] OCR skipped — missing library: {e}")
+    except ImportError:
+        return ""
+    try:
+        reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        parts = []
+        for img, _ in page_images:
+            arr = np.array(img)
+            results = reader.readtext(arr, detail=0, paragraph=True)
+            parts.extend(results)
+        return "\n".join(parts)
+    except Exception as e:
+        warn(f"OCR error: {e}")
         return ""
 
-    text_parts = []
-    try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)   # 2× zoom ≈ 144 DPI — good for OCR
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                pix.height, pix.width, pix.n
-            )
-            img = Image.fromarray(img_array)
-            t = pytesseract.image_to_string(img, config="--psm 6")
-            if t.strip():
-                text_parts.append(t)
-        doc.close()
-    except Exception as e:
-        print(f"  [WARN] OCR error: {e}")
-    return "\n".join(text_parts).strip()
+
+def _merge(digital: str, ocr: str) -> str:
+    """
+    Merge digital + OCR text.
+    Adds OCR lines that are not already present in the digital text,
+    catching text hidden inside images/figures that pdfplumber can't see.
+    """
+    if not ocr:    return digital
+    if not digital: return ocr
+    digital_tokens = set(digital.lower().split())
+    extra = []
+    for line in ocr.splitlines():
+        line = line.strip()
+        if len(line.split()) < 4: continue
+        overlap = len(set(line.lower().split()) & digital_tokens) / max(len(line.split()), 1)
+        if overlap < 0.4:
+            extra.append(line)
+    return (digital + "\n" + "\n".join(extra)).strip() if extra else digital
 
 
-def get_text(pdf_path: str, use_ocr: bool) -> tuple[str, bool]:
-    """
-    Returns (text, used_ocr).
-    Falls back to OCR automatically if text extraction yields < 50 words.
-    """
-    text = extract_text_from_pdf(pdf_path)
+def extract_all_text(pdf_path: str, page_images: list,
+                     use_ocr: bool) -> tuple[str, bool]:
+    """Full pipeline. Returns (text, ocr_was_used)."""
+    digital  = _extract_digital(pdf_path)
+    ocr_text = ""
     used_ocr = False
-    if len(text.split()) < 50 and use_ocr:
-        print(f"  [OCR] Low text yield from {os.path.basename(pdf_path)} — trying OCR…")
-        ocr_text = ocr_pdf(pdf_path)
-        if len(ocr_text.split()) > len(text.split()):
-            text = ocr_text
-            used_ocr = True
-    return text, used_ocr
+
+    if use_ocr:
+        ocr_text = _run_easyocr(page_images)
+        used_ocr = bool(ocr_text.strip())
+
+    merged = _merge(digital, ocr_text)
+
+    # Last resort: re-rasterize at higher DPI if still nearly empty
+    if len(merged.split()) < 40 and use_ocr and not used_ocr:
+        warn(f"Low yield for {os.path.basename(pdf_path)}, retrying OCR at 250 DPI…")
+        hi_pages = rasterize_pdf(pdf_path, dpi=250)
+        ocr_text = _run_easyocr(hi_pages)
+        merged   = _merge(digital, ocr_text)
+        used_ocr = bool(ocr_text.strip())
+
+    return merged.strip(), used_ocr
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TEXT PREPROCESSING
+# LAYER 3 — CODE DETECTION & SIMILARITY
+# Detects code in PDFs from any origin:
+#   • Fenced markdown blocks  (```)
+#   • Heuristic detection of monospaced / indented blocks
+#     using C/C++/Arduino/Java/Python syntax signals
+# Comparison: AST normalisation for Python (renames all variables),
+#             raw token n-gram for other languages.
+# ══════════════════════════════════════════════════════════════════════════════
+
+CODE_FENCE_RE = re.compile(r"```[\w+]*\s*\n(.*?)```", re.DOTALL)
+
+CODE_LINE_RE = re.compile(
+    r"(?:[{};]"
+    r"|(?:void|int|float|char|bool|String|return|if\s*\(|for\s*\(|while\s*\()"
+    r"|(?:def |class |import |from |#include|#define|pinMode|digitalWrite|analogRead)"
+    r"|(?:==|!=|<=|>=|&&|\|\||\+\+|--)"
+    r"|(?:\w+\s*\(.*\)\s*[{;]))"
+)
+
+def extract_code_blocks(text: str) -> list[str]:
+    blocks = []
+    # 1. Fenced markdown
+    for m in CODE_FENCE_RE.finditer(text):
+        b = m.group(1).strip()
+        if b: blocks.append(b)
+    # 2. Heuristic: consecutive lines that look like code
+    current = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if CODE_LINE_RE.search(stripped) or (line.startswith("    ") and stripped):
+            current.append(line)
+        else:
+            if len(current) >= 3:
+                blocks.append("\n".join(current))
+            current = []
+    if len(current) >= 3:
+        blocks.append("\n".join(current))
+    # Deduplicate
+    seen, out = set(), []
+    for b in blocks:
+        key = b[:120]
+        if key not in seen:
+            seen.add(key); out.append(b)
+    return out
+
+
+class ASTNorm(ast.NodeVisitor):
+    """Canonical token stream from a Python AST, all identifiers renamed."""
+    def __init__(self):
+        self.tokens: list[str] = []
+        self._m: dict[str, str] = {}
+        self._n = 0
+    def _r(self, name):
+        if name not in self._m: self._m[name] = f"V{self._n}"; self._n += 1
+        return self._m[name]
+    def generic_visit(self, node):
+        self.tokens.append(type(node).__name__); super().generic_visit(node)
+    def visit_Name(self, node):        self.tokens.append(self._r(node.id))
+    def visit_FunctionDef(self, node):
+        self.tokens += ["FuncDef", self._r(node.name)]; self.generic_visit(node)
+    def visit_arg(self, node):         self.tokens.append(self._r(node.arg))
+    def visit_Constant(self, node):    self.tokens.append(f"C_{type(node.value).__name__}")
+
+
+def _code_tokens(block: str) -> list[str]:
+    try:
+        tree = ast.parse(block); v = ASTNorm(); v.visit(tree); return v.tokens
+    except SyntaxError:
+        return re.findall(r"[A-Za-z_]\w*|[+\-*/=<>!&|^~]+|[(){}\[\],.;:]|\d+", block)
+
+
+def _ngram(t1, t2, n=3) -> float:
+    ng1 = Counter(tuple(t1[i:i+n]) for i in range(len(t1)-n+1))
+    ng2 = Counter(tuple(t2[i:i+n]) for i in range(len(t2)-n+1))
+    shared = sum((ng1 & ng2).values())
+    total  = sum(ng1.values()) + sum(ng2.values())
+    return 2 * shared / total if total else 0.0
+
+
+def code_similarity(b1: list[str], b2: list[str]) -> float:
+    if not b1 or not b2: return 0.0
+    scores = []
+    for x in b1:
+        tx = _code_tokens(x)
+        scores.append(max(_ngram(tx, _code_tokens(y), 3) for y in b2))
+    for y in b2:
+        ty = _code_tokens(y)
+        scores.append(max(_ngram(ty, _code_tokens(x), 3) for x in b1))
+    return sum(scores) / len(scores)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 4 — VISUAL SIMILARITY
+# Two-level comparison to catch copies at any scale:
+#
+#   Level A — Full-page perceptual hash
+#             Catches entirely copied or near-identical pages.
+#
+#   Level B — Sliding-window tile hashing
+#             Splits each page into overlapping 64×64 px tiles.
+#             A matching tile means a copied figure/diagram even when
+#             the surrounding page content is completely different.
+#             This is what catches circuit diagrams, connection diagrams,
+#             charts, and any other visual copied into an otherwise unique page.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _phash(img, size: int = 16) -> str:
+    try:
+        thumb  = img.resize((size, size)).convert("L")
+        pixels = list(thumb.getdata())
+        avg    = sum(pixels) / len(pixels)
+        return "".join("1" if p >= avg else "0" for p in pixels)
+    except Exception:
+        return ""
+
+def _hamming(h1: str, h2: str) -> int:
+    return sum(a != b for a, b in zip(h1, h2))
+
+def _tile_hashes(img, tile: int = 64, step: int = 32) -> list[str]:
+    """Overlapping tile perceptual hashes for a page image."""
+    w, h = img.size
+    out = []
+    for y in range(0, h - tile + 1, step):
+        for x in range(0, w - tile + 1, step):
+            h_ = _phash(img.crop((x, y, x+tile, y+tile)), size=8)
+            if h_: out.append(h_)
+    return out
+
+def visual_similarity(pages1: list, pages2: list) -> tuple[float, int, int]:
+    """Returns (score 0-1, matching_full_pages, matching_tile_pairs)."""
+    if not pages1 or not pages2: return 0.0, 0, 0
+
+    FULL_T = int(16*16 * 0.12)   # 12% bit-diff tolerance for full pages
+    TILE_T = int(8 * 8 * 0.15)   # 15% for tiles
+
+    imgs1 = [img for img, _ in pages1]
+    imgs2 = [img for img, _ in pages2]
+
+    # Level A: full-page hash
+    ph1 = [_phash(img, 16) for img in imgs1]
+    ph2 = [_phash(img, 16) for img in imgs2]
+    matched1, matched2 = set(), set()
+    for i, h1 in enumerate(ph1):
+        if not h1: continue
+        for j, h2 in enumerate(ph2):
+            if not h2: continue
+            if _hamming(h1, h2) <= FULL_T:
+                matched1.add(i); matched2.add(j)
+
+    # Level B: tile hash on pages not already matched
+    tile_matches = 0
+    um1 = [i for i in range(len(imgs1)) if i not in matched1]
+    um2 = [j for j in range(len(imgs2)) if j not in matched2]
+    for i in um1:
+        tiles1 = _tile_hashes(imgs1[i])
+        for j in um2:
+            tiles2_set = set(_tile_hashes(imgs2[j]))
+            for t1 in tiles1:
+                for t2 in tiles2_set:
+                    if _hamming(t1, t2) <= TILE_T:
+                        tile_matches += 1
+                        break
+
+    pg  = len(matched1)
+    tot = max(len(imgs1), len(imgs2))
+    page_score = pg / tot if tot else 0.0
+    tile_score = min(tile_matches / max(tot * 5, 1), 1.0)
+    return 0.7 * page_score + 0.3 * tile_score, pg, tile_matches
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 5 — TEXT SIMILARITY
 # ══════════════════════════════════════════════════════════════════════════════
 
 STOPWORDS = {
@@ -120,481 +356,218 @@ STOPWORDS = {
     "again","then","once","here","there","about","against","without",
 }
 
-def normalize(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+def _norm(text): return re.sub(r"\s+"," ", re.sub(r"[^a-z0-9\s]"," ", text.lower())).strip()
+def _tok(text, rm=True):
+    w = _norm(text).split()
+    return [x for x in w if x not in STOPWORDS and len(x)>2] if rm else w
 
-def tokenize(text: str, remove_stopwords: bool = True) -> list[str]:
-    words = normalize(text).split()
-    if remove_stopwords:
-        words = [w for w in words if w not in STOPWORDS and len(w) > 2]
-    return words
-
-def get_ngrams(tokens: list[str], n: int) -> list[tuple]:
-    return [tuple(tokens[i:i+n]) for i in range(len(tokens) - n + 1)]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TEXT SIMILARITY METRICS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def cosine_similarity(t1: list[str], t2: list[str]) -> float:
+def _cosine(t1, t2) -> float:
     c1, c2 = Counter(t1), Counter(t2)
-    vocab = set(c1) | set(c2)
-    if not vocab:
-        return 0.0
-    dot  = sum(c1[w] * c2[w] for w in vocab)
-    mag1 = math.sqrt(sum(v**2 for v in c1.values()))
-    mag2 = math.sqrt(sum(v**2 for v in c2.values()))
-    return dot / (mag1 * mag2) if mag1 and mag2 else 0.0
+    vocab = set(c1)|set(c2)
+    if not vocab: return 0.0
+    dot  = sum(c1[w]*c2[w] for w in vocab)
+    m1   = math.sqrt(sum(v**2 for v in c1.values()))
+    m2   = math.sqrt(sum(v**2 for v in c2.values()))
+    return dot/(m1*m2) if m1 and m2 else 0.0
 
-def jaccard_similarity(s1: set, s2: set) -> float:
-    if not s1 and not s2:
-        return 0.0
-    return len(s1 & s2) / len(s1 | s2)
+def _jaccard(s1, s2) -> float:
+    if not s1 and not s2: return 0.0
+    return len(s1&s2)/len(s1|s2)
 
-def ngram_overlap(t1: list[str], t2: list[str], n: int = 3) -> float:
-    ng1 = Counter(get_ngrams(t1, n))
-    ng2 = Counter(get_ngrams(t2, n))
-    shared = sum((ng1 & ng2).values())
-    total  = sum(ng1.values()) + sum(ng2.values())
-    return 2 * shared / total if total else 0.0
-
-def lcs_chunk_ratio(t1: str, t2: str, chunk: int = 200) -> float:
-    def chunks(s, size):
-        return {s[i:i+size] for i in range(0, len(s)-size+1, size//2)}
-    c1, c2 = chunks(t1, chunk), chunks(t2, chunk)
-    if not c1 and not c2:
-        return 0.0
-    return len(c1 & c2) / max(len(c1), len(c2))
+def _lcs(t1, t2, size=150) -> float:
+    def ch(s): return {s[i:i+size] for i in range(0, max(0,len(s)-size+1), size//2)}
+    c1,c2 = ch(t1),ch(t2)
+    if not c1 and not c2: return 0.0
+    return len(c1&c2)/max(len(c1),len(c2))
 
 def text_similarity(text1: str, text2: str) -> dict:
-    tok1  = tokenize(text1)
-    tok2  = tokenize(text2)
-    raw1  = tokenize(text1, remove_stopwords=False)
-    raw2  = tokenize(text2, remove_stopwords=False)
-    norm1 = normalize(text1)
-    norm2 = normalize(text2)
-
-    scores = {
-        "cosine":        cosine_similarity(tok1, tok2),
-        "jaccard":       jaccard_similarity(set(tok1), set(tok2)),
-        "bigram_dice":   ngram_overlap(tok1, tok2, n=2),
-        "trigram_dice":  ngram_overlap(tok1, tok2, n=3),
-        "fourgram_dice": ngram_overlap(raw1, raw2, n=4),
-        "lcs_chunk":     lcs_chunk_ratio(norm1, norm2),
+    t1,t2   = _tok(text1), _tok(text2)
+    r1,r2   = _tok(text1,False), _tok(text2,False)
+    n1,n2   = _norm(text1), _norm(text2)
+    s = {
+        "cosine":        _cosine(t1,t2),
+        "jaccard":       _jaccard(set(t1),set(t2)),
+        "bigram_dice":   _ngram(t1,t2,2),
+        "trigram_dice":  _ngram(t1,t2,3),
+        "fourgram_dice": _ngram(r1,r2,4),
+        "lcs_chunk":     _lcs(n1,n2),
     }
-    weights = {"cosine":0.20,"jaccard":0.10,"bigram_dice":0.15,
-               "trigram_dice":0.25,"fourgram_dice":0.20,"lcs_chunk":0.10}
-    scores["composite"] = sum(scores[k] * weights[k] for k in weights)
-    return scores
+    w = {"cosine":0.20,"jaccard":0.10,"bigram_dice":0.15,
+         "trigram_dice":0.25,"fourgram_dice":0.20,"lcs_chunk":0.10}
+    s["composite"] = sum(s[k]*w[k] for k in w)
+    return s
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CODE SIMILARITY (AST-BASED)
-# ══════════════════════════════════════════════════════════════════════════════
-
-CODE_FENCE_RE = re.compile(
-    r"```(?:python|py|java|javascript|js|c|cpp|c\+\+|go|rust|ts|typescript)?\s*\n(.*?)```",
-    re.DOTALL | re.IGNORECASE,
-)
-
-INLINE_CODE_RE = re.compile(r"`([^`\n]{10,})`")
-
-def extract_code_blocks(text: str) -> list[str]:
-    blocks = CODE_FENCE_RE.findall(text)
-    if not blocks:
-        blocks = INLINE_CODE_RE.findall(text)
-    return [b.strip() for b in blocks if b.strip()]
-
-class ASTNormalizer(ast.NodeVisitor):
-    """Walk a Python AST and emit a canonical token sequence."""
-    def __init__(self):
-        self.tokens: list[str] = []
-        self._var_map: dict[str, str] = {}
-        self._counter = 0
-
-    def _var(self, name: str) -> str:
-        if name not in self._var_map:
-            self._var_map[name] = f"VAR{self._counter}"
-            self._counter += 1
-        return self._var_map[name]
-
-    def generic_visit(self, node):
-        self.tokens.append(type(node).__name__)
-        super().generic_visit(node)
-
-    def visit_Name(self, node):
-        self.tokens.append(self._var(node.id))
-
-    def visit_FunctionDef(self, node):
-        self.tokens.append("FunctionDef")
-        self.tokens.append(self._var(node.name))
-        self.generic_visit(node)
-
-    def visit_arg(self, node):
-        self.tokens.append(self._var(node.arg))
-
-    def visit_Constant(self, node):
-        # Collapse all literals to their type
-        self.tokens.append(f"CONST_{type(node.value).__name__}")
-
-def ast_tokens(code: str) -> list[str]:
-    try:
-        tree = ast.parse(code)
-        v = ASTNormalizer()
-        v.visit(tree)
-        return v.tokens
-    except SyntaxError:
-        # Not valid Python — fall back to token-level comparison
-        return re.findall(r"[A-Za-z_]\w*|[+\-*/=<>!&|^~]+|[(){}\[\],.;:]", code)
-
-def code_block_similarity(blocks1: list[str], blocks2: list[str]) -> float:
-    """
-    Compare all pairs of code blocks and return the mean best-match score.
-    Uses AST token n-gram overlap for Python; raw token overlap otherwise.
-    """
-    if not blocks1 or not blocks2:
-        return 0.0
-
-    def block_score(b1: str, b2: str) -> float:
-        t1 = ast_tokens(b1)
-        t2 = ast_tokens(b2)
-        return ngram_overlap(t1, t2, n=3)
-
-    # For each block in doc1, find its best match in doc2
-    scores = []
-    for b1 in blocks1:
-        best = max(block_score(b1, b2) for b2 in blocks2)
-        scores.append(best)
-    # Symmetric: also check from doc2's perspective
-    for b2 in blocks2:
-        best = max(block_score(b2, b1) for b1 in blocks1)
-        scores.append(best)
-
-    return sum(scores) / len(scores) if scores else 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IMAGE SIMILARITY
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_images_from_pdf(pdf_path: str) -> list:
-    """Return list of PIL Images extracted from the PDF."""
-    images = []
-    try:
-        import fitz
-        from PIL import Image
-        import numpy as np
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            for img_info in page.get_images(full=True):
-                xref = img_info[0]
-                base = doc.extract_image(xref)
-                img_bytes = base["image"]
-                import io
-                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                # Skip tiny images (icons, decorations)
-                if img.width >= 80 and img.height >= 80:
-                    images.append(img)
-        doc.close()
-    except Exception:
-        pass
-    return images
-
-def image_hash(img, size: int = 16) -> str:
-    """Perceptual hash (average hash) of an image."""
-    try:
-        from PIL import Image, ImageFilter
-        img = img.resize((size, size)).convert("L")
-        pixels = list(img.getdata())
-        avg = sum(pixels) / len(pixels)
-        bits = "".join("1" if p >= avg else "0" for p in pixels)
-        return bits
-    except Exception:
-        return ""
-
-def hamming_distance(h1: str, h2: str) -> int:
-    return sum(b1 != b2 for b1, b2 in zip(h1, h2))
-
-def image_similarity(imgs1: list, imgs2: list) -> tuple[float, int]:
-    """
-    Returns (similarity_score 0-1, number_of_matching_pairs).
-    Two images match if their perceptual hash distance < threshold.
-    """
-    if not imgs1 or not imgs2:
-        return 0.0, 0
-
-    HASH_SIZE   = 16
-    THRESHOLD   = int(HASH_SIZE * HASH_SIZE * 0.15)  # 15% bit difference allowed
-
-    hashes1 = [image_hash(img, HASH_SIZE) for img in imgs1]
-    hashes2 = [image_hash(img, HASH_SIZE) for img in imgs2]
-
-    matched1 = set()
-    matched2 = set()
-    for i, h1 in enumerate(hashes1):
-        if not h1:
-            continue
-        for j, h2 in enumerate(hashes2):
-            if not h2:
-                continue
-            if hamming_distance(h1, h2) <= THRESHOLD:
-                matched1.add(i)
-                matched2.add(j)
-
-    if not matched1:
-        return 0.0, 0
-
-    # Score = fraction of images that have a match (penalises large unique sets)
-    score = len(matched1) / max(len(imgs1), len(imgs2))
-    return score, len(matched1)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STRUCTURE SIMILARITY
+# LAYER 6 — STRUCTURE SIMILARITY
 # ══════════════════════════════════════════════════════════════════════════════
 
 HEADING_RE = re.compile(
-    r"^(?:"
-    r"(?:\d+[\.\d]*\.?\s+[A-Z].{2,80})"       # Numbered: "1. Introduction"
-    r"|(?:[A-Z][A-Z\s]{3,50})"                 # ALL CAPS heading
-    r"|(?:#{1,4}\s+.{3,80})"                   # Markdown: "## Heading"
-    r")$",
+    r"^(?:\d+[\.\d]*\.?\s+[A-Z].{2,80}|[A-Z][A-Z\s]{3,50}|#{1,4}\s+.{3,80})$",
     re.MULTILINE,
 )
-
-def extract_headings(text: str) -> list[str]:
-    headings = []
+def _headings(text):
+    out = []
     for line in text.splitlines():
         line = line.strip()
         if HEADING_RE.match(line):
-            # Normalize heading text
-            h = re.sub(r"^[#\d\.\s]+", "", line).strip().lower()
-            h = re.sub(r"[^a-z0-9\s]", "", h).strip()
-            if 3 <= len(h.split()) <= 12:
-                headings.append(h)
-    return headings
+            h = re.sub(r"[^a-z0-9\s]","", re.sub(r"^[#\d\.\s]+","",line).strip().lower()).strip()
+            if 3 <= len(h.split()) <= 12: out.append(h)
+    return out
 
-def structure_similarity(text1: str, text2: str) -> tuple[float, list[tuple[str,str]]]:
-    """
-    Returns (score, list_of_matching_heading_pairs).
-    """
-    h1 = extract_headings(text1)
-    h2 = extract_headings(text2)
-
-    if not h1 or not h2:
-        return 0.0, []
-
-    matches = []
-    used2   = set()
+def structure_similarity(t1, t2):
+    h1, h2 = _headings(t1), _headings(t2)
+    if not h1 or not h2: return 0.0, []
+    matches, used2 = [], set()
     for head1 in h1:
         tok1 = set(head1.split())
-        best_score, best_j, best_h2 = 0.0, -1, ""
+        bs, bj, bh = 0.0, -1, ""
         for j, head2 in enumerate(h2):
-            if j in used2:
-                continue
-            tok2 = set(head2.split())
-            s = jaccard_similarity(tok1, tok2)
-            if s > best_score:
-                best_score, best_j, best_h2 = s, j, head2
-        if best_score >= 0.5:
-            matches.append((head1, best_h2))
-            used2.add(best_j)
-
-    score = len(matches) / max(len(h1), len(h2)) if (h1 or h2) else 0.0
-    return score, matches[:10]
+            if j in used2: continue
+            s = _jaccard(tok1, set(head2.split()))
+            if s > bs: bs, bj, bh = s, j, head2
+        if bs >= 0.5: matches.append((head1, bh)); used2.add(bj)
+    return len(matches)/max(len(h1),len(h2)), matches[:10]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SENTENCE MATCHING
+# LAYER 7 — SENTENCE MATCHING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_matching_sentences(text1: str, text2: str,
-                            min_words: int = 8,
-                            threshold: float = 0.75) -> list[tuple[str, str, float]]:
-    def split_sentences(text):
-        parts = re.split(r'(?<=[.!?])\s+', text.strip())
-        return [p.strip() for p in parts if len(p.split()) >= min_words]
-
-    sents1 = split_sentences(text1)
-    sents2 = split_sentences(text2)
-    matches = []
-    for s1 in sents1:
-        tok1 = set(tokenize(s1))
-        for s2 in sents2:
-            tok2 = set(tokenize(s2))
-            j = jaccard_similarity(tok1, tok2)
-            if j >= threshold:
-                matches.append((s1, s2, j))
-
-    matches.sort(key=lambda x: -x[2])
-    seen, unique = set(), []
-    for m in matches:
-        if m[0] not in seen:
-            seen.add(m[0])
-            unique.append(m)
-    return unique[:15]
+def matching_sentences(t1, t2, threshold=0.75):
+    def split(t):
+        return [p.strip() for p in re.split(r'(?<=[.!?])\s+', t.strip()) if len(p.split())>=8]
+    results = []
+    for s1 in split(t1):
+        tok1 = set(_tok(s1))
+        for s2 in split(t2):
+            j = _jaccard(tok1, set(_tok(s2)))
+            if j >= threshold: results.append((s1,s2,j))
+    results.sort(key=lambda x: -x[2])
+    seen, out = set(), []
+    for m in results:
+        if m[0] not in seen: seen.add(m[0]); out.append(m)
+    return out[:15]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMPOSITE SCORE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def overall_score(text_score: float,
-                  code_score: float,  has_code: bool,
-                  img_score: float,   has_imgs: bool,
-                  struct_score: float) -> float:
-    """
-    Weighted composite across all four dimensions.
-    Weights shift depending on what content was actually found.
-    """
-    if has_code and has_imgs:
-        w = {"text": 0.50, "code": 0.20, "image": 0.20, "struct": 0.10}
-    elif has_code:
-        w = {"text": 0.60, "code": 0.25, "image": 0.00, "struct": 0.15}
-    elif has_imgs:
-        w = {"text": 0.60, "code": 0.00, "image": 0.25, "struct": 0.15}
+def composite(text_s, code_s, has_code, vis_s, struct_s) -> float:
+    if has_code:
+        w = {"t":0.45,"c":0.25,"v":0.15,"s":0.15}
     else:
-        w = {"text": 0.75, "code": 0.00, "image": 0.00, "struct": 0.25}
-
-    return (text_score   * w["text"]   +
-            code_score   * w["code"]   +
-            img_score    * w["image"]  +
-            struct_score * w["struct"])
+        w = {"t":0.55,"c":0.00,"v":0.25,"s":0.20}
+    return text_s*w["t"] + code_s*w["c"] + vis_s*w["v"] + struct_s*w["s"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RENDERING
+# REPORT
 # ══════════════════════════════════════════════════════════════════════════════
 
-COLORS = {
-    "reset":  "\033[0m",  "bold":   "\033[1m",
-    "red":    "\033[91m", "yellow": "\033[93m",
-    "green":  "\033[92m", "cyan":   "\033[96m",
-    "dim":    "\033[2m",  "blue":   "\033[94m",
-}
+def bar(value, width=36):
+    filled = int(round(value*width))
+    col = "red" if value>=0.7 else "yellow" if value>=0.45 else "green"
+    return c(col,"█"*filled) + c("dim","░"*(width-filled))
 
-def c(color: str, text: str) -> str:
-    return f"{COLORS.get(color,'')}{text}{COLORS['reset']}"
+def verdict(score):
+    if score>=0.70: return "HIGH SIMILARITY — likely plagiarism",         "red"
+    if score>=0.45: return "MODERATE SIMILARITY — manual review advised", "yellow"
+    if score>=0.20: return "LOW SIMILARITY — some shared content",        "cyan"
+    return                 "MINIMAL SIMILARITY — likely original work",   "green"
 
-def verdict(score: float) -> tuple[str, str]:
-    if score >= 0.70: return "HIGH SIMILARITY — likely plagiarism",          "red"
-    if score >= 0.45: return "MODERATE SIMILARITY — manual review advised",  "yellow"
-    if score >= 0.20: return "LOW SIMILARITY — some shared content",         "cyan"
-    return                   "MINIMAL SIMILARITY — likely original work",    "green"
-
-def bar(value: float, width: int = 36) -> str:
-    filled = int(round(value * width))
-    col = "red" if value >= 0.7 else "yellow" if value >= 0.45 else "green"
-    return c(col, "█" * filled) + c("dim", "░" * (width - filled))
-
-def section(title: str, w: int = 67) -> None:
+def sec(title, W=67):
     print(c("bold", f"\n  {title}"))
-    print(c("dim",  "  " + "─" * (w - 2)))
+    print(c("dim",  "  "+"─"*(W-2)))
 
-def print_report(path1, path2, word_counts,
-                 text_scores, sent_matches,
-                 code_score, code_blocks,
-                 img_score,  img_match_count, img_counts,
-                 struct_score, struct_matches,
-                 final_score,
-                 ocr_flags) -> None:
-
+def print_report(p1, p2, wc, ocr_flags,
+                 t_scores, sent_matches,
+                 c_score, code_blocks,
+                 v_score, v_pages, v_tiles, pg_counts,
+                 s_score, s_matches, score):
     W = 67
     print()
-    print(c("bold", "═" * W))
-    print(c("bold", "        ASSIGNMENT PLAGIARISM CHECKER — REPORT"))
-    print(c("bold", "═" * W))
-    ocr1 = " [OCR]" if ocr_flags[0] else ""
-    ocr2 = " [OCR]" if ocr_flags[1] else ""
-    print(f"  File 1 : {os.path.basename(path1)}{ocr1}  ({word_counts[0]:,} words)")
-    print(f"  File 2 : {os.path.basename(path2)}{ocr2}  ({word_counts[1]:,} words)")
+    print(c("bold","═"*W))
+    print(c("bold","        ASSIGNMENT PLAGIARISM CHECKER — REPORT"))
+    print(c("bold","═"*W))
+    for i,(path,words,used_ocr) in enumerate(zip([p1,p2],wc,ocr_flags),1):
+        tag = c("cyan"," [+OCR]") if used_ocr else ""
+        print(f"  File {i} : {os.path.basename(path)}{tag}  ({words:,} words)")
 
-    # ── Overall ───────────────────────────────────────────────────────────────
-    label, col = verdict(final_score)
+    label, col = verdict(score)
     print()
-    print(c("bold", "  OVERALL SIMILARITY SCORE"))
-    print(f"  {bar(final_score)}  {c(col, f'{final_score*100:.1f}%')}")
+    print(c("bold","  OVERALL SIMILARITY SCORE"))
+    print(f"  {bar(score)}  {c(col, f'{score*100:.1f}%')}")
     print(f"\n  Verdict: {c(col, c('bold', label))}")
 
-    # ── Dimension summary ─────────────────────────────────────────────────────
-    section("DIMENSION SUMMARY", W)
-    dims = [
-        ("📝 Text",      text_scores["composite"], True),
-        ("💻 Code",      code_score,               len(code_blocks[0]) > 0 or len(code_blocks[1]) > 0),
-        ("🖼  Images",   img_score,                img_counts[0] > 0 or img_counts[1] > 0),
-        ("🏗  Structure", struct_score,             True),
-    ]
-    for name, score, active in dims:
-        note = "" if active else c("dim", "  (not detected)")
-        print(f"  {name:<14}  {bar(score, 20)}  {score*100:5.1f}%{note}")
+    has_code = len(code_blocks[0])>0 or len(code_blocks[1])>0
+    sec("DIMENSION SUMMARY", W)
+    for name, sc, active in [
+        ("📝 Text",       t_scores["composite"], True),
+        ("💻 Code",       c_score,               has_code),
+        ("🖼  Visuals",   v_score,               pg_counts[0]>0),
+        ("🏗  Structure", s_score,               True),
+    ]:
+        note = "" if active else c("dim","  (not detected)")
+        print(f"  {name:<15}  {bar(sc,20)}  {sc*100:5.1f}%{note}")
 
-    # ── Text metrics ──────────────────────────────────────────────────────────
-    section("TEXT METRIC BREAKDOWN", W)
-    labels = {
-        "cosine":        "Cosine Similarity (TF-weighted)",
-        "jaccard":       "Jaccard Index (vocabulary overlap)",
-        "bigram_dice":   "Bigram Dice (2-word phrases)",
-        "trigram_dice":  "Trigram Dice (3-word phrases)",
-        "fourgram_dice": "4-gram Dice (4-word phrases)",
-        "lcs_chunk":     "Chunk LCS (verbatim passage overlap)",
-    }
-    for key, lbl in labels.items():
-        v = text_scores[key]
-        print(f"  {lbl:<44}  {bar(v, 16)}  {v*100:5.1f}%")
+    sec("TEXT METRIC BREAKDOWN", W)
+    for key, lbl in [
+        ("cosine",        "Cosine Similarity (TF-weighted)"),
+        ("jaccard",       "Jaccard Index (vocabulary overlap)"),
+        ("bigram_dice",   "Bigram Dice (2-word phrases)"),
+        ("trigram_dice",  "Trigram Dice (3-word phrases)"),
+        ("fourgram_dice", "4-gram Dice (4-word phrases)"),
+        ("lcs_chunk",     "Chunk LCS (verbatim passage overlap)"),
+    ]:
+        v = t_scores[key]
+        print(f"  {lbl:<44}  {bar(v,16)}  {v*100:5.1f}%")
 
-    # ── Code blocks ───────────────────────────────────────────────────────────
-    section("CODE ANALYSIS", W)
-    nb1, nb2 = len(code_blocks[0]), len(code_blocks[1])
-    if nb1 == 0 and nb2 == 0:
-        print(c("dim", "  No code blocks detected in either document."))
+    sec("CODE ANALYSIS", W)
+    nb1,nb2 = len(code_blocks[0]),len(code_blocks[1])
+    if nb1==0 and nb2==0:
+        print(c("dim","  No code segments detected in either document."))
     else:
-        print(f"  Code blocks found — Doc1: {nb1}, Doc2: {nb2}")
-        print(f"  AST-level code similarity:  {bar(code_score, 20)}  {code_score*100:.1f}%")
-        if code_score >= 0.7:
-            print(c("red", "  ⚠  High code similarity — possible code copying detected."))
+        print(f"  Code segments — Doc1: {nb1},  Doc2: {nb2}")
+        print(f"  AST-normalised similarity:  {bar(c_score,20)}  {c_score*100:.1f}%")
+        if   c_score>=0.70: print(c("red",   "  ⚠  High code similarity — likely code copying."))
+        elif c_score>=0.45: print(c("yellow","  ⚠  Moderate code similarity — review recommended."))
 
-    # ── Images ────────────────────────────────────────────────────────────────
-    section("IMAGE ANALYSIS", W)
-    n1, n2 = img_counts
-    if n1 == 0 and n2 == 0:
-        print(c("dim", "  No embedded images found in either document."))
+    sec("VISUAL ANALYSIS", W)
+    p1c,p2c = pg_counts
+    if p1c==0 and p2c==0:
+        print(c("dim","  Could not rasterize pages."))
     else:
-        print(f"  Images found — Doc1: {n1}, Doc2: {n2}")
-        print(f"  Matching image pairs: {img_match_count}")
-        print(f"  Visual similarity:    {bar(img_score, 20)}  {img_score*100:.1f}%")
-        if img_score >= 0.5:
-            print(c("yellow", "  ⚠  Significant image overlap detected."))
+        print(f"  Pages rasterized — Doc1: {p1c},  Doc2: {p2c}")
+        print(f"  Matching full pages:  {v_pages}")
+        print(f"  Matching image tiles: {v_tiles}  (copied figures / diagrams)")
+        print(f"  Visual similarity:  {bar(v_score,20)}  {v_score*100:.1f}%")
+        if   v_score>=0.50: print(c("red",   "  ⚠  High visual overlap — figures or pages may be copied."))
+        elif v_score>=0.20: print(c("yellow","  ⚠  Some visual overlap — check diagrams and figures."))
 
-    # ── Structure ─────────────────────────────────────────────────────────────
-    section("STRUCTURE ANALYSIS", W)
-    if not struct_matches:
-        if struct_score == 0.0:
-            print(c("dim", "  No headings detected — structure comparison unavailable."))
-        else:
-            print("  No matching headings found.")
+    sec("STRUCTURE ANALYSIS", W)
+    if not s_matches:
+        msg = "No headings detected — structure comparison unavailable." if s_score==0.0 else "No closely matching headings found."
+        print(c("dim", f"  {msg}"))
     else:
-        print(f"  Heading similarity: {bar(struct_score, 20)}  {struct_score*100:.1f}%")
-        print(f"  Matching headings ({len(struct_matches)}):")
-        for h1, h2 in struct_matches:
-            eq = "≈" if h1 != h2 else "="
-            print(f"    {c('dim','•')} \"{h1}\"  {eq}  \"{h2}\"")
+        print(f"  Heading similarity: {bar(s_score,20)}  {s_score*100:.1f}%")
+        print(f"  Matching headings ({len(s_matches)}):")
+        for h1,h2 in s_matches:
+            print(f"    {c('dim','•')} \"{h1}\"  {'=' if h1==h2 else '≈'}  \"{h2}\"")
 
-    # ── Sentence matches ──────────────────────────────────────────────────────
-    section("HIGHLY SIMILAR SENTENCE PAIRS", W)
+    sec("HIGHLY SIMILAR SENTENCE PAIRS", W)
     if not sent_matches:
-        print(c("green", "  No highly similar individual sentences found."))
+        print(c("green","  No highly similar sentence pairs found."))
     else:
-        for i, (s1, s2, score) in enumerate(sent_matches, 1):
-            col2 = "red" if score >= 0.9 else "yellow"
-            print(f"\n  {c('bold', f'[{i}]')}  Similarity: {c(col2, f'{score*100:.0f}%')}")
+        for i,(s1,s2,sc) in enumerate(sent_matches,1):
+            col2 = "red" if sc>=0.9 else "yellow"
+            print(f"\n  {c('bold',f'[{i}]')}  Similarity: {c(col2,f'{sc*100:.0f}%')}")
             print(f"  {c('dim','  Doc1:')} {s1[:200]}{'…' if len(s1)>200 else ''}")
             print(f"  {c('dim','  Doc2:')} {s2[:200]}{'…' if len(s2)>200 else ''}")
 
     print()
-    print(c("bold", "═" * W))
+    print(c("bold","═"*W))
     print()
 
 
@@ -610,75 +583,69 @@ def main():
 Examples:
   plagcheck essay1.pdf essay2.pdf
   plagcheck essay1.pdf essay2.pdf --no-ocr
-  plagcheck essay1.pdf essay2.pdf --no-images
+  plagcheck essay1.pdf essay2.pdf --no-visuals
   plagcheck essay1.pdf essay2.pdf --sentence-threshold 0.85
         """,
     )
-    parser.add_argument("pdf1",  help="Path to the first PDF")
-    parser.add_argument("pdf2",  help="Path to the second PDF")
-    parser.add_argument("--no-ocr",       action="store_true", help="Disable OCR fallback for scanned PDFs")
-    parser.add_argument("--no-images",    action="store_true", help="Skip image comparison")
-    parser.add_argument("--no-sentences", action="store_true", help="Skip sentence-level matching")
-    parser.add_argument("--sentence-threshold", type=float, default=0.75, metavar="T",
-                        help="Jaccard threshold for sentence pairs (default: 0.75)")
+    parser.add_argument("pdf1")
+    parser.add_argument("pdf2")
+    parser.add_argument("--no-ocr",       action="store_true", help="Skip OCR (easyocr)")
+    parser.add_argument("--no-visuals",   action="store_true", help="Skip visual comparison")
+    parser.add_argument("--no-sentences", action="store_true", help="Skip sentence matching")
+    parser.add_argument("--sentence-threshold", type=float, default=0.75, metavar="T")
     args = parser.parse_args()
 
-    # ── Extract text ──────────────────────────────────────────────────────────
-    print(c("cyan", "\n  Extracting text…"))
-    text1, ocr1 = get_text(args.pdf1, not args.no_ocr)
-    text2, ocr2 = get_text(args.pdf2, not args.no_ocr)
+    for p in [args.pdf1, args.pdf2]:
+        if not os.path.isfile(p): die(f"File not found: {p}")
+
+    print(c("cyan","\n  Rasterizing pages…"))
+    pages1 = rasterize_pdf(args.pdf1, dpi=150)
+    pages2 = rasterize_pdf(args.pdf2, dpi=150)
+    print(f"  → Doc 1: {len(pages1)} pages")
+    print(f"  → Doc 2: {len(pages2)} pages")
+
+    print(c("cyan","  Extracting text…"))
+    text1, ocr1 = extract_all_text(args.pdf1, pages1, not args.no_ocr)
+    text2, ocr2 = extract_all_text(args.pdf2, pages2, not args.no_ocr)
     wc1, wc2 = len(text1.split()), len(text2.split())
-    print(f"  → Doc 1: {wc1:,} words {'(OCR)' if ocr1 else ''}")
-    print(f"  → Doc 2: {wc2:,} words {'(OCR)' if ocr2 else ''}")
+    print(f"  → Doc 1: {wc1:,} words {'[+OCR]' if ocr1 else ''}")
+    print(f"  → Doc 2: {wc2:,} words {'[+OCR]' if ocr2 else ''}")
+    if wc1<20 or wc2<20: warn("Very little text extracted — results may be unreliable.")
 
-    if wc1 < 20 or wc2 < 20:
-        print(c("yellow", "  [WARN] Very little text extracted. Results may be unreliable."))
-
-    # ── Text scores ───────────────────────────────────────────────────────────
-    print(c("cyan", "  Computing text similarity…"))
+    print(c("cyan","  Computing text similarity…"))
     t_scores = text_similarity(text1, text2)
 
-    # ── Sentence matches ──────────────────────────────────────────────────────
     sent_matches = []
     if not args.no_sentences:
-        print(c("cyan", "  Scanning for matching sentences…"))
-        sent_matches = find_matching_sentences(text1, text2, threshold=args.sentence_threshold)
+        print(c("cyan","  Scanning for matching sentences…"))
+        sent_matches = matching_sentences(text1, text2, args.sentence_threshold)
 
-    # ── Code similarity ───────────────────────────────────────────────────────
-    print(c("cyan", "  Analysing code blocks…"))
+    print(c("cyan","  Analysing code…"))
     blocks1 = extract_code_blocks(text1)
     blocks2 = extract_code_blocks(text2)
-    c_score = code_block_similarity(blocks1, blocks2)
+    c_score = code_similarity(blocks1, blocks2)
+    print(f"  → Code segments — Doc1: {len(blocks1)}, Doc2: {len(blocks2)}")
 
-    # ── Image similarity ──────────────────────────────────────────────────────
-    i_score, img_match_count, imgs1, imgs2 = 0.0, 0, [], []
-    if not args.no_images:
-        print(c("cyan", "  Comparing images…"))
-        imgs1 = extract_images_from_pdf(args.pdf1)
-        imgs2 = extract_images_from_pdf(args.pdf2)
-        i_score, img_match_count = image_similarity(imgs1, imgs2)
+    v_score, v_pages, v_tiles = 0.0, 0, 0
+    if not args.no_visuals:
+        print(c("cyan","  Comparing visuals…"))
+        v_score, v_pages, v_tiles = visual_similarity(pages1, pages2)
 
-    # ── Structure similarity ──────────────────────────────────────────────────
-    print(c("cyan", "  Analysing document structure…"))
-    s_score, struct_matches = structure_similarity(text1, text2)
+    print(c("cyan","  Analysing structure…"))
+    s_score, s_matches = structure_similarity(text1, text2)
 
-    # ── Final composite ───────────────────────────────────────────────────────
-    has_code = len(blocks1) > 0 or len(blocks2) > 0
-    has_imgs = len(imgs1) > 0 or len(imgs2) > 0
-    final = overall_score(t_scores["composite"], c_score, has_code,
-                          i_score, has_imgs, s_score)
+    has_code = len(blocks1)>0 or len(blocks2)>0
+    score = composite(t_scores["composite"], c_score, has_code, v_score, s_score)
 
     print_report(
         args.pdf1, args.pdf2,
-        (wc1, wc2),
+        (wc1, wc2), (ocr1, ocr2),
         t_scores, sent_matches,
         c_score, (blocks1, blocks2),
-        i_score, img_match_count, (len(imgs1), len(imgs2)),
-        s_score, struct_matches,
-        final,
-        (ocr1, ocr2),
+        v_score, v_pages, v_tiles, (len(pages1), len(pages2)),
+        s_score, s_matches,
+        score,
     )
-
 
 if __name__ == "__main__":
     main()

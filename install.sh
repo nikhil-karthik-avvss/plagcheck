@@ -22,33 +22,40 @@ if ! command -v python3 &>/dev/null; then
 fi
 echo "[✓] Python 3 found: $(python3 --version)"
 
-# ── 2. Install system deps (optional, non-fatal) ──────────────────────────────
-echo ""
-echo "[*] Trying to install system dependencies (optional)…"
-if sudo apt-get install -y -qq tesseract-ocr 2>/dev/null; then
-    echo "[✓] tesseract-ocr installed (enables OCR for scanned PDFs)"
-else
-    echo "[!] Skipped tesseract-ocr (apt issue — OCR will be unavailable)."
-fi
-
-# ── 3. Create a dedicated venv ────────────────────────────────────────────────
+# ── 2. Create a dedicated venv ────────────────────────────────────────────────
 echo ""
 echo "[*] Creating virtual environment at $VENV_DIR …"
 python3 -m venv "$VENV_DIR"
 echo "[✓] Virtual environment ready"
 
-# ── 4. Install Python deps inside the venv ────────────────────────────────────
+# ── 3. Install all Python dependencies (no system packages needed) ────────────
 echo ""
-echo "[*] Installing Python dependencies inside venv…"
+echo "[*] Installing Python dependencies…"
+echo "    (easyocr will download its model weights on first run — ~100 MB)"
+echo ""
+"$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet \
-    pdfplumber pypdf pdfminer.six \
-    pymupdf pillow pytesseract
-echo "[✓] Installed: pdfplumber, pypdf, pdfminer.six, pymupdf, pillow, pytesseract"
+    pdfplumber \
+    pypdf \
+    pdfminer.six \
+    pymupdf \
+    pillow \
+    numpy \
+    easyocr
+echo "[✓] All dependencies installed"
+echo ""
+echo "  Packages installed:"
+echo "    pdfplumber  — digital text extraction (Word, LibreOffice, LaTeX PDFs)"
+echo "    pypdf       — fallback text extraction"
+echo "    pymupdf     — page rasterization (all PDF types)"
+echo "    pillow      — image processing"
+echo "    numpy       — array operations"
+echo "    easyocr     — OCR engine (fully pip-based, no system binary needed)"
 
-# ── 5. Copy the script into the venv ──────────────────────────────────────────
+# ── 4. Copy the script into the venv ──────────────────────────────────────────
 cp "$SOURCE" "$VENV_DIR/plagiarism_checker.py"
 
-# ── 6. Write a thin launcher to /usr/local/bin ────────────────────────────────
+# ── 5. Write a thin launcher to /usr/local/bin ────────────────────────────────
 echo ""
 echo "[*] Installing '$COMMAND_NAME' command to $INSTALL_DIR …"
 sudo tee "$TARGET" > /dev/null << EOF
@@ -58,7 +65,7 @@ EOF
 sudo chmod +x "$TARGET"
 echo "[✓] Installed launcher at $TARGET"
 
-# ── 7. Verify ─────────────────────────────────────────────────────────────────
+# ── 6. Verify ─────────────────────────────────────────────────────────────────
 echo ""
 if command -v "$COMMAND_NAME" &>/dev/null; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -67,11 +74,13 @@ if command -v "$COMMAND_NAME" &>/dev/null; then
     echo "     $COMMAND_NAME file1.pdf file2.pdf"
     echo ""
     echo "  Options:"
-    echo "     --no-ocr               Skip OCR for scanned PDFs"
-    echo "     --no-images            Skip image comparison"
+    echo "     --no-ocr               Skip OCR"
+    echo "     --no-visuals           Skip visual comparison"
     echo "     --no-sentences         Skip sentence matching"
-    echo "     --sentence-threshold T Set similarity threshold (default 0.75)"
+    echo "     --sentence-threshold T Similarity threshold (default 0.75)"
     echo "     --help                 Show all options"
+    echo ""
+    echo "  Note: First run downloads easyocr model weights (~100 MB)."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 else
     echo "[WARN] '$COMMAND_NAME' not found in PATH."
